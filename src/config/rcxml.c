@@ -44,10 +44,17 @@ static bool in_touch;
 static bool in_libinput_category;
 static bool in_window_switcher_field;
 static bool in_window_rules;
-static bool in_action_query;
-static bool in_action_then_branch;
-static bool in_action_else_branch;
-static bool in_action_none_branch;
+
+struct parser_state {
+	struct wl_list *current_siblings;
+	struct action *current_action;
+	struct view_query *current_view_query;
+	bool in_action;
+	bool in_action_query;
+	bool in_action_then_branch;
+	bool in_action_else_branch;
+	bool in_action_none_branch;
+};
 
 static struct usable_area_override *current_usable_area_override;
 static struct keybind *current_keybind;
@@ -61,8 +68,6 @@ static struct region *current_region;
 static struct window_switcher_field *current_field;
 static struct window_rule *current_window_rule;
 static struct action *current_window_rule_action;
-static struct view_query *current_view_query;
-static struct action *current_child_action;
 /* for backword compatibility of <mouse><scrollFactor> */
 static double mouse_scroll_factor = -1;
 
@@ -430,18 +435,20 @@ fill_region(char *nodename, char *content)
 }
 
 static void
-fill_action_query(char *nodename, char *content, struct action *action)
+fill_action_query(char *nodename, char *content, struct parser_state *state)
 {
-	if (!action) {
+	if (!state->current_action) {
 		wlr_log(WLR_ERROR, "No parent action for query: %s=%s", nodename, content);
 		return;
 	}
 
 	string_truncate_at_pattern(nodename, ".keybind.keyboard");
 	string_truncate_at_pattern(nodename, ".mousebind.context.mouse");
+	string_truncate_at_pattern(nodename, ".then.action");
+	string_truncate_at_pattern(nodename, ".else.action");
 
 	if (!strcasecmp(nodename, "query.action")) {
-		current_view_query = NULL;
+		state->current_view_query = NULL;
 	}
 
 	string_truncate_at_pattern(nodename, ".query.action");
@@ -450,58 +457,52 @@ fill_action_query(char *nodename, char *content, struct action *action)
 		return;
 	}
 
-	if (!current_view_query) {
-		struct wl_list *queries = action_get_querylist(action, "query");
+	if (!state->current_view_query) {
+		struct wl_list *queries = action_get_querylist(state->current_action, "query");
 		if (!queries) {
-			action_arg_add_querylist(action, "query");
-			queries = action_get_querylist(action, "query");
+			action_arg_add_querylist(state->current_action, "query");
+			queries = action_get_querylist(state->current_action, "query");
 		}
-		current_view_query = view_query_create();
-		wl_list_append(queries, &current_view_query->link);
+		state->current_view_query = view_query_create();
+		wl_list_append(queries, &state->current_view_query->link);
 	}
 
 	if (!strcasecmp(nodename, "identifier")) {
-		xstrdup_replace(current_view_query->identifier, content);
+		xstrdup_replace(state->current_view_query->identifier, content);
 	} else if (!strcasecmp(nodename, "title")) {
-		xstrdup_replace(current_view_query->title, content);
+		xstrdup_replace(state->current_view_query->title, content);
 	} else if (!strcmp(nodename, "type")) {
-		current_view_query->window_type = parse_window_type(content);
+		state->current_view_query->window_type = parse_window_type(content);
 	} else if (!strcasecmp(nodename, "sandboxEngine")) {
-		xstrdup_replace(current_view_query->sandbox_engine, content);
+		xstrdup_replace(state->current_view_query->sandbox_engine, content);
 	} else if (!strcasecmp(nodename, "sandboxAppId")) {
-		xstrdup_replace(current_view_query->sandbox_app_id, content);
+		xstrdup_replace(state->current_view_query->sandbox_app_id, content);
 	} else if (!strcasecmp(nodename, "shaded")) {
-		current_view_query->shaded = parse_three_state(content);
+		state->current_view_query->shaded = parse_three_state(content);
 	} else if (!strcasecmp(nodename, "maximized")) {
-		current_view_query->maximized = view_axis_parse(content);
+		state->current_view_query->maximized = view_axis_parse(content);
 	} else if (!strcasecmp(nodename, "iconified")) {
-		current_view_query->iconified = parse_three_state(content);
+		state->current_view_query->iconified = parse_three_state(content);
 	} else if (!strcasecmp(nodename, "focused")) {
-		current_view_query->focused = parse_three_state(content);
+		state->current_view_query->focused = parse_three_state(content);
 	} else if (!strcasecmp(nodename, "omnipresent")) {
-		current_view_query->omnipresent = parse_three_state(content);
+		state->current_view_query->omnipresent = parse_three_state(content);
 	} else if (!strcasecmp(nodename, "tiled")) {
-		current_view_query->tiled = view_edge_parse(content);
+		state->current_view_query->tiled = view_edge_parse(content);
 	} else if (!strcasecmp(nodename, "tiled_region")) {
-		xstrdup_replace(current_view_query->tiled_region, content);
+		xstrdup_replace(state->current_view_query->tiled_region, content);
 	} else if (!strcasecmp(nodename, "desktop")) {
-		xstrdup_replace(current_view_query->desktop, content);
+		xstrdup_replace(state->current_view_query->desktop, content);
 	} else if (!strcasecmp(nodename, "decoration")) {
-		current_view_query->decoration = ssd_mode_parse(content);
+		state->current_view_query->decoration = ssd_mode_parse(content);
 	} else if (!strcasecmp(nodename, "monitor")) {
-		xstrdup_replace(current_view_query->monitor, content);
+		xstrdup_replace(state->current_view_query->monitor, content);
 	}
 }
 
 static void
-fill_child_action(char *nodename, char *content, struct action *parent,
-	const char *branch_name)
+fill_action(char *nodename, const char *content, struct parser_state *state)
 {
-	if (!parent) {
-		wlr_log(WLR_ERROR, "No parent action for branch: %s=%s", nodename, content);
-		return;
-	}
-
 	string_truncate_at_pattern(nodename, ".keybind.keyboard");
 	string_truncate_at_pattern(nodename, ".mousebind.context.mouse");
 	string_truncate_at_pattern(nodename, ".then.action");
@@ -509,46 +510,47 @@ fill_child_action(char *nodename, char *content, struct action *parent,
 	string_truncate_at_pattern(nodename, ".none.action");
 
 	if (!strcasecmp(nodename, "action")) {
-		current_child_action = NULL;
-	}
-
-	if (!content) {
 		return;
-	}
-
-	struct wl_list *siblings = action_get_actionlist(parent, branch_name);
-	if (!siblings) {
-		action_arg_add_actionlist(parent, branch_name);
-		siblings = action_get_actionlist(parent, branch_name);
-	}
-
-	if (!strcasecmp(nodename, "name.action")) {
-		if (!strcasecmp(content, "If") || !strcasecmp(content, "ForEach")) {
-			wlr_log(WLR_ERROR, "action '%s' cannot be a child action", content);
-			return;
+	} else if (!strcmp(nodename, "name.action")) {
+		state->current_action = action_create(content);
+		if (state->current_action) {
+			wl_list_append(state->current_siblings, &state->current_action->link);
 		}
-		current_child_action = action_create(content);
-		if (current_child_action) {
-			wl_list_append(siblings, &current_child_action->link);
-		}
-	} else if (!current_child_action) {
+	} else if (!state->current_action) {
 		wlr_log(WLR_ERROR, "expect <action name=\"\"> element first. "
 			"nodename: '%s' content: '%s'", nodename, content);
 	} else {
-		action_arg_from_xml_node(current_child_action, nodename, content);
+		action_arg_from_xml_node(state->current_action, nodename, content);
 	}
 }
 
 static void
-fill_keybind(char *nodename, char *content)
+fill_child_action(char *nodename, char *content, struct parser_state *state,
+	const char *branch_name)
+{
+	if (!state->current_action) {
+		wlr_log(WLR_ERROR, "No parent action for branch: %s=%s", nodename, content);
+		return;
+	}
+
+	struct wl_list *siblings = action_get_actionlist(state->current_action, branch_name);
+	if (!siblings) {
+		action_arg_add_actionlist(state->current_action, branch_name);
+		siblings = action_get_actionlist(state->current_action, branch_name);
+	}
+	state->current_siblings = siblings;
+}
+
+static void
+fill_keybind(char *nodename, char *content, struct parser_state *state)
 {
 	if (!content) {
 		return;
 	}
+
 	string_truncate_at_pattern(nodename, ".keybind.keyboard");
 	if (!strcmp(nodename, "key")) {
 		current_keybind = keybind_create(content);
-		current_keybind_action = NULL;
 		/*
 		 * If an invalid keybind has been provided,
 		 * keybind_create() complains.
@@ -557,6 +559,8 @@ fill_keybind(char *nodename, char *content)
 			wlr_log(WLR_ERROR, "Invalid keybind: %s", content);
 			return;
 		}
+		state->current_action = NULL;
+		state->current_siblings = &current_keybind->actions;
 	} else if (!current_keybind) {
 		wlr_log(WLR_ERROR, "expect <keybind key=\"\"> element first. "
 			"nodename: '%s' content: '%s'", nodename, content);
@@ -566,27 +570,11 @@ fill_keybind(char *nodename, char *content)
 		set_bool(content, &current_keybind->use_syms_only);
 	} else if (!strcasecmp(nodename, "allowWhenLocked")) {
 		set_bool(content, &current_keybind->allow_when_locked);
-	} else if (!strcmp(nodename, "name.action")) {
-		current_keybind_action = action_create(content);
-		if (current_keybind_action) {
-			wl_list_append(&current_keybind->actions,
-				&current_keybind_action->link);
-		}
-	} else if (!current_keybind_action) {
-		wlr_log(WLR_ERROR, "expect <action name=\"\"> element first. "
-			"nodename: '%s' content: '%s'", nodename, content);
-	} else {
-		/*
-		 * Here we deal with action sub-elements such as <to>, <output>,
-		 * <region>, <direction> and so on. This is common to key- and
-		 * mousebinds.
-		 */
-		action_arg_from_xml_node(current_keybind_action, nodename, content);
 	}
 }
 
 static void
-fill_mousebind(char *nodename, char *content)
+fill_mousebind(char *nodename, char *content, struct parser_state *state)
 {
 	/*
 	 * Example of what we are parsing:
@@ -601,11 +589,18 @@ fill_mousebind(char *nodename, char *content)
 		wlr_log(WLR_ERROR, "expect <context name=\"\"> element first. "
 			"nodename: '%s' content: '%s'", nodename, content);
 		return;
-	} else if (!strcmp(nodename, "mousebind.context.mouse")) {
+	}
+
+	if (!strcmp(nodename, "mousebind.context.mouse")) {
 		wlr_log(WLR_INFO, "create mousebind for %s",
 			current_mouse_context);
 		current_mousebind = mousebind_create(current_mouse_context);
-		current_mousebind_action = NULL;
+		if (!current_mousebind) {
+			wlr_log(WLR_ERROR, "Invalid mousebind: %s", content);
+			return;
+		}
+		state->current_action = NULL;
+		state->current_siblings = &current_mousebind->actions;
 		return;
 	} else if (!content) {
 		return;
@@ -626,17 +621,6 @@ fill_mousebind(char *nodename, char *content)
 		/* <mousebind button="" action="EVENT"> */
 		current_mousebind->mouse_event =
 			mousebind_event_from_str(content);
-	} else if (!strcmp(nodename, "name.action")) {
-		current_mousebind_action = action_create(content);
-		if (current_mousebind_action) {
-			wl_list_append(&current_mousebind->actions,
-				&current_mousebind_action->link);
-		}
-	} else if (!current_mousebind_action) {
-		wlr_log(WLR_ERROR, "expect <action name=\"\"> element first. "
-			"nodename: '%s' content: '%s'", nodename, content);
-	} else {
-		action_arg_from_xml_node(current_mousebind_action, nodename, content);
 	}
 }
 
@@ -958,93 +942,80 @@ set_tearing_mode(const char *str, enum tearing_mode *variable)
 }
 
 static void
-entry(xmlNode *node, char *nodename, char *content)
+entry(xmlNode *node, struct parser_state *state)
 {
 	/* current <theme><font place=""></font></theme> */
 	static enum font_place font_place = FONT_PLACE_NONE;
-
 	static uint32_t button_map_from;
+	char *content = (char *)node->content;
+	static char buffer[256];
+	char *name = nodename(node, buffer, sizeof(buffer));
 
-	if (!nodename) {
+	if (!name) {
 		return;
 	}
-	string_truncate_at_pattern(nodename, ".openbox_config");
-	string_truncate_at_pattern(nodename, ".labwc_config");
+	string_truncate_at_pattern(name, ".openbox_config");
+	string_truncate_at_pattern(name, ".labwc_config");
 
 	if (getenv("LABWC_DEBUG_CONFIG_NODENAMES")) {
-		printf("%s: %s\n", nodename, content);
+		printf("%s: %s\n", name, content);
 	}
 
 	if (in_usable_area_override) {
-		fill_usable_area_override(nodename, content);
+		fill_usable_area_override(name, content);
 	}
-	if (in_keybind) {
-		if (in_action_query) {
-			fill_action_query(nodename, content,
-				current_keybind_action);
-		} else if (in_action_then_branch) {
-			fill_child_action(nodename, content,
-				current_keybind_action, "then");
-		} else if (in_action_else_branch) {
-			fill_child_action(nodename, content,
-				current_keybind_action, "else");
-		} else if (in_action_none_branch) {
-			fill_child_action(nodename, content,
-				current_keybind_action, "none");
+
+	if ((in_keybind || in_mousebind) && state->in_action) {
+		if (state->in_action_query) {
+			fill_action_query(name, content, state);
+		} else if (state->in_action_then_branch) {
+			fill_child_action(name, content, state, "then");
+		} else if (state->in_action_else_branch) {
+			fill_child_action(name, content, state, "else");
+		} else if (state->in_action_none_branch) {
+			fill_child_action(name, content, state, "none");
 		} else {
-			fill_keybind(nodename, content);
+			fill_action(name, content, state);
 		}
+	} else if (in_keybind) {
+		fill_keybind(name, content, state);
+	} else if (in_mousebind) {
+		fill_mousebind(name, content, state);
 	}
-	if (in_mousebind) {
-		if (in_action_query) {
-			fill_action_query(nodename, content,
-				current_mousebind_action);
-		} else if (in_action_then_branch) {
-			fill_child_action(nodename, content,
-				current_mousebind_action, "then");
-		} else if (in_action_else_branch) {
-			fill_child_action(nodename, content,
-				current_mousebind_action, "else");
-		} else if (in_action_none_branch) {
-			fill_child_action(nodename, content,
-				current_mousebind_action, "none");
-		} else {
-			fill_mousebind(nodename, content);
-		}
-	}
+
 	if (in_touch) {
-		fill_touch(nodename, content);
+		fill_touch(name, content);
 		return;
 	}
 	if (in_libinput_category) {
-		fill_libinput_category(nodename, content);
+		fill_libinput_category(name, content);
 		return;
 	}
 	if (in_regions) {
-		fill_region(nodename, content);
+		fill_region(name, content);
 		return;
 	}
 	if (in_window_switcher_field) {
-		fill_window_switcher_field(nodename, content);
+		fill_window_switcher_field(name, content);
 		return;
 	}
 	if (in_window_rules) {
-		fill_window_rule(nodename, content);
+		fill_window_rule(name, content);
 		return;
 	}
 
 	/* handle nodes without content, e.g. <keyboard><default /> */
-	if (!strcmp(nodename, "default.keyboard")) {
+	if (!strcmp(name, "default.keyboard")) {
 		load_default_key_bindings();
 		return;
 	}
-	if (!strcmp(nodename, "devault.mouse")
-			|| !strcmp(nodename, "default.mouse")) {
+	if (!strcmp(name, "devault.mouse")
+			|| !strcmp(name, "default.mouse")) {
 		load_default_mouse_bindings();
 		return;
 	}
 
-	if (!strcasecmp(nodename, "map.tablet")) {
+	if (!strcasecmp(name, "map.tablet")) {
 		button_map_from = UINT32_MAX;
 		return;
 	}
@@ -1053,111 +1024,111 @@ entry(xmlNode *node, char *nodename, char *content)
 	if (!content) {
 		return;
 	}
-	if (!strcmp(nodename, "place.font.theme")) {
+	if (!strcmp(name, "place.font.theme")) {
 		font_place = enum_font_place(content);
 		if (font_place == FONT_PLACE_UNKNOWN) {
 			wlr_log(WLR_ERROR, "invalid font place %s", content);
 		}
 	}
 
-	if (!strcmp(nodename, "decoration.core")) {
+	if (!strcmp(name, "decoration.core")) {
 		if (!strcmp(content, "client")) {
 			rc.xdg_shell_server_side_deco = false;
 		} else {
 			rc.xdg_shell_server_side_deco = true;
 		}
-	} else if (!strcmp(nodename, "gap.core")) {
+	} else if (!strcmp(name, "gap.core")) {
 		rc.gap = atoi(content);
-	} else if (!strcasecmp(nodename, "adaptiveSync.core")) {
+	} else if (!strcasecmp(name, "adaptiveSync.core")) {
 		set_adaptive_sync_mode(content, &rc.adaptive_sync);
-	} else if (!strcasecmp(nodename, "allowTearing.core")) {
+	} else if (!strcasecmp(name, "allowTearing.core")) {
 		set_tearing_mode(content, &rc.allow_tearing);
-	} else if (!strcasecmp(nodename, "reuseOutputMode.core")) {
+	} else if (!strcasecmp(name, "reuseOutputMode.core")) {
 		set_bool(content, &rc.reuse_output_mode);
-	} else if (!strcmp(nodename, "policy.placement")) {
+	} else if (!strcmp(name, "policy.placement")) {
 		enum view_placement_policy policy = view_placement_parse(content);
 		if (policy != LAB_PLACE_INVALID) {
 			rc.placement_policy = policy;
 		}
-	} else if (!strcasecmp(nodename, "xwaylandPersistence.core")) {
+	} else if (!strcasecmp(name, "xwaylandPersistence.core")) {
 		set_bool(content, &rc.xwayland_persistence);
-	} else if (!strcasecmp(nodename, "x.cascadeOffset.placement")) {
+	} else if (!strcasecmp(name, "x.cascadeOffset.placement")) {
 		rc.placement_cascade_offset_x = atoi(content);
-	} else if (!strcasecmp(nodename, "y.cascadeOffset.placement")) {
+	} else if (!strcasecmp(name, "y.cascadeOffset.placement")) {
 		rc.placement_cascade_offset_y = atoi(content);
-	} else if (!strcmp(nodename, "name.theme")) {
+	} else if (!strcmp(name, "name.theme")) {
 		xstrdup_replace(rc.theme_name, content);
-	} else if (!strcmp(nodename, "icon.theme")) {
+	} else if (!strcmp(name, "icon.theme")) {
 		xstrdup_replace(rc.icon_theme_name, content);
-	} else if (!strcasecmp(nodename, "layout.titlebar.theme")) {
+	} else if (!strcasecmp(name, "layout.titlebar.theme")) {
 		fill_title_layout(content);
-	} else if (!strcasecmp(nodename, "showTitle.titlebar.theme")) {
+	} else if (!strcasecmp(name, "showTitle.titlebar.theme")) {
 		rc.show_title = parse_bool(content, true);
-	} else if (!strcmp(nodename, "cornerradius.theme")) {
+	} else if (!strcmp(name, "cornerradius.theme")) {
 		rc.corner_radius = atoi(content);
-	} else if (!strcasecmp(nodename, "keepBorder.theme")) {
+	} else if (!strcasecmp(name, "keepBorder.theme")) {
 		set_bool(content, &rc.ssd_keep_border);
-	} else if (!strcasecmp(nodename, "dropShadows.theme")) {
+	} else if (!strcasecmp(name, "dropShadows.theme")) {
 		set_bool(content, &rc.shadows_enabled);
-	} else if (!strcmp(nodename, "name.font.theme")) {
-		fill_font(nodename, content, font_place);
-	} else if (!strcmp(nodename, "size.font.theme")) {
-		fill_font(nodename, content, font_place);
-	} else if (!strcmp(nodename, "slant.font.theme")) {
-		fill_font(nodename, content, font_place);
-	} else if (!strcmp(nodename, "weight.font.theme")) {
-		fill_font(nodename, content, font_place);
-	} else if (!strcasecmp(nodename, "followMouse.focus")) {
+	} else if (!strcmp(name, "name.font.theme")) {
+		fill_font(name, content, font_place);
+	} else if (!strcmp(name, "size.font.theme")) {
+		fill_font(name, content, font_place);
+	} else if (!strcmp(name, "slant.font.theme")) {
+		fill_font(name, content, font_place);
+	} else if (!strcmp(name, "weight.font.theme")) {
+		fill_font(name, content, font_place);
+	} else if (!strcasecmp(name, "followMouse.focus")) {
 		set_bool(content, &rc.focus_follow_mouse);
-	} else if (!strcasecmp(nodename, "followMouseRequiresMovement.focus")) {
+	} else if (!strcasecmp(name, "followMouseRequiresMovement.focus")) {
 		set_bool(content, &rc.focus_follow_mouse_requires_movement);
-	} else if (!strcasecmp(nodename, "raiseOnFocus.focus")) {
+	} else if (!strcasecmp(name, "raiseOnFocus.focus")) {
 		set_bool(content, &rc.raise_on_focus);
-	} else if (!strcasecmp(nodename, "doubleClickTime.mouse")) {
+	} else if (!strcasecmp(name, "doubleClickTime.mouse")) {
 		long doubleclick_time_parsed = strtol(content, NULL, 10);
 		if (doubleclick_time_parsed > 0) {
 			rc.doubleclick_time = doubleclick_time_parsed;
 		} else {
 			wlr_log(WLR_ERROR, "invalid doubleClickTime");
 		}
-	} else if (!strcasecmp(nodename, "scrollFactor.mouse")) {
+	} else if (!strcasecmp(name, "scrollFactor.mouse")) {
 		/* This is deprecated. Show an error message in post_processing() */
 		set_double(content, &mouse_scroll_factor);
-	} else if (!strcasecmp(nodename, "name.context.mouse")) {
+	} else if (!strcasecmp(name, "name.context.mouse")) {
 		current_mouse_context = content;
 		current_mousebind = NULL;
 
-	} else if (!strcasecmp(nodename, "repeatRate.keyboard")) {
+	} else if (!strcasecmp(name, "repeatRate.keyboard")) {
 		rc.repeat_rate = atoi(content);
-	} else if (!strcasecmp(nodename, "repeatDelay.keyboard")) {
+	} else if (!strcasecmp(name, "repeatDelay.keyboard")) {
 		rc.repeat_delay = atoi(content);
-	} else if (!strcasecmp(nodename, "numlock.keyboard")) {
+	} else if (!strcasecmp(name, "numlock.keyboard")) {
 		set_bool(content, &rc.kb_numlock_enable);
-	} else if (!strcasecmp(nodename, "layoutScope.keyboard")) {
+	} else if (!strcasecmp(name, "layoutScope.keyboard")) {
 		/*
 		 * This can be changed to an enum later on
 		 * if we decide to also support "application".
 		 */
 		rc.kb_layout_per_window = !strcasecmp(content, "window");
-	} else if (!strcasecmp(nodename, "screenEdgeStrength.resistance")) {
+	} else if (!strcasecmp(name, "screenEdgeStrength.resistance")) {
 		rc.screen_edge_strength = atoi(content);
-	} else if (!strcasecmp(nodename, "windowEdgeStrength.resistance")) {
+	} else if (!strcasecmp(name, "windowEdgeStrength.resistance")) {
 		rc.window_edge_strength = atoi(content);
-	} else if (!strcasecmp(nodename, "unSnapThreshold.resistance")) {
+	} else if (!strcasecmp(name, "unSnapThreshold.resistance")) {
 		rc.unsnap_threshold = atoi(content);
-	} else if (!strcasecmp(nodename, "unMaximizeThreshold.resistance")) {
+	} else if (!strcasecmp(name, "unMaximizeThreshold.resistance")) {
 		rc.unmaximize_threshold = atoi(content);
-	} else if (!strcasecmp(nodename, "range.snapping")) {
+	} else if (!strcasecmp(name, "range.snapping")) {
 		rc.snap_edge_range = atoi(content);
-	} else if (!strcasecmp(nodename, "enabled.overlay.snapping")) {
+	} else if (!strcasecmp(name, "enabled.overlay.snapping")) {
 		set_bool(content, &rc.snap_overlay_enabled);
-	} else if (!strcasecmp(nodename, "inner.delay.overlay.snapping")) {
+	} else if (!strcasecmp(name, "inner.delay.overlay.snapping")) {
 		rc.snap_overlay_delay_inner = atoi(content);
-	} else if (!strcasecmp(nodename, "outer.delay.overlay.snapping")) {
+	} else if (!strcasecmp(name, "outer.delay.overlay.snapping")) {
 		rc.snap_overlay_delay_outer = atoi(content);
-	} else if (!strcasecmp(nodename, "topMaximize.snapping")) {
+	} else if (!strcasecmp(name, "topMaximize.snapping")) {
 		set_bool(content, &rc.snap_top_maximize);
-	} else if (!strcasecmp(nodename, "notifyClient.snapping")) {
+	} else if (!strcasecmp(name, "notifyClient.snapping")) {
 		if (!strcasecmp(content, "always")) {
 			rc.snap_tiling_events_mode = LAB_TILING_EVENTS_ALWAYS;
 		} else if (!strcasecmp(content, "region")) {
@@ -1171,55 +1142,55 @@ entry(xmlNode *node, char *nodename, char *content)
 		}
 
 	/* <windowSwitcher show="" preview="" outlines="" /> */
-	} else if (!strcasecmp(nodename, "show.windowSwitcher")) {
+	} else if (!strcasecmp(name, "show.windowSwitcher")) {
 		set_bool(content, &rc.window_switcher.show);
-	} else if (!strcasecmp(nodename, "preview.windowSwitcher")) {
+	} else if (!strcasecmp(name, "preview.windowSwitcher")) {
 		set_bool(content, &rc.window_switcher.preview);
-	} else if (!strcasecmp(nodename, "outlines.windowSwitcher")) {
+	} else if (!strcasecmp(name, "outlines.windowSwitcher")) {
 		set_bool(content, &rc.window_switcher.outlines);
-	} else if (!strcasecmp(nodename, "allWorkspaces.windowSwitcher")) {
+	} else if (!strcasecmp(name, "allWorkspaces.windowSwitcher")) {
 		if (parse_bool(content, -1) == true) {
 			rc.window_switcher.criteria &=
 				~LAB_VIEW_CRITERIA_CURRENT_WORKSPACE;
 		}
 
 	/* Remove this long term - just a friendly warning for now */
-	} else if (strstr(nodename, "windowswitcher.core")) {
+	} else if (strstr(name, "windowswitcher.core")) {
 		wlr_log(WLR_ERROR, "<windowSwitcher> should not be child of <core>");
 
 	/* The following three are for backward compatibility only */
-	} else if (!strcasecmp(nodename, "show.windowSwitcher.core")) {
+	} else if (!strcasecmp(name, "show.windowSwitcher.core")) {
 		set_bool(content, &rc.window_switcher.show);
-	} else if (!strcasecmp(nodename, "preview.windowSwitcher.core")) {
+	} else if (!strcasecmp(name, "preview.windowSwitcher.core")) {
 		set_bool(content, &rc.window_switcher.preview);
-	} else if (!strcasecmp(nodename, "outlines.windowSwitcher.core")) {
+	} else if (!strcasecmp(name, "outlines.windowSwitcher.core")) {
 		set_bool(content, &rc.window_switcher.outlines);
 
 	/* The following three are for backward compatibility only */
-	} else if (!strcasecmp(nodename, "cycleViewOSD.core")) {
+	} else if (!strcasecmp(name, "cycleViewOSD.core")) {
 		set_bool(content, &rc.window_switcher.show);
 		wlr_log(WLR_ERROR, "<cycleViewOSD> is deprecated."
 			" Use <windowSwitcher show=\"\" />");
-	} else if (!strcasecmp(nodename, "cycleViewPreview.core")) {
+	} else if (!strcasecmp(name, "cycleViewPreview.core")) {
 		set_bool(content, &rc.window_switcher.preview);
 		wlr_log(WLR_ERROR, "<cycleViewPreview> is deprecated."
 			" Use <windowSwitcher preview=\"\" />");
-	} else if (!strcasecmp(nodename, "cycleViewOutlines.core")) {
+	} else if (!strcasecmp(name, "cycleViewOutlines.core")) {
 		set_bool(content, &rc.window_switcher.outlines);
 		wlr_log(WLR_ERROR, "<cycleViewOutlines> is deprecated."
 			" Use <windowSwitcher outlines=\"\" />");
 
-	} else if (!strcasecmp(nodename, "name.names.desktops")) {
+	} else if (!strcasecmp(name, "name.names.desktops")) {
 		struct workspace *workspace = znew(*workspace);
 		workspace->name = xstrdup(content);
 		wl_list_append(&rc.workspace_config.workspaces, &workspace->link);
-	} else if (!strcasecmp(nodename, "popupTime.desktops")) {
+	} else if (!strcasecmp(name, "popupTime.desktops")) {
 		rc.workspace_config.popuptime = atoi(content);
-	} else if (!strcasecmp(nodename, "number.desktops")) {
+	} else if (!strcasecmp(name, "number.desktops")) {
 		rc.workspace_config.min_nr_workspaces = MAX(1, atoi(content));
-	} else if (!strcasecmp(nodename, "prefix.desktops")) {
+	} else if (!strcasecmp(name, "prefix.desktops")) {
 		xstrdup_replace(rc.workspace_config.prefix, content);
-	} else if (!strcasecmp(nodename, "popupShow.resize")) {
+	} else if (!strcasecmp(name, "popupShow.resize")) {
 		if (!strcasecmp(content, "Always")) {
 			rc.resize_indicator = LAB_RESIZE_INDICATOR_ALWAYS;
 		} else if (!strcasecmp(content, "Never")) {
@@ -1229,25 +1200,25 @@ entry(xmlNode *node, char *nodename, char *content)
 		} else {
 			wlr_log(WLR_ERROR, "Invalid value for <resize popupShow />");
 		}
-	} else if (!strcasecmp(nodename, "drawContents.resize")) {
+	} else if (!strcasecmp(name, "drawContents.resize")) {
 		set_bool(content, &rc.resize_draw_contents);
-	} else if (!strcasecmp(nodename, "mouseEmulation.tablet")) {
+	} else if (!strcasecmp(name, "mouseEmulation.tablet")) {
 		set_bool(content, &rc.tablet.force_mouse_emulation);
-	} else if (!strcasecmp(nodename, "mapToOutput.tablet")) {
+	} else if (!strcasecmp(name, "mapToOutput.tablet")) {
 		xstrdup_replace(rc.tablet.output_name, content);
-	} else if (!strcasecmp(nodename, "rotate.tablet")) {
+	} else if (!strcasecmp(name, "rotate.tablet")) {
 		rc.tablet.rotation = tablet_parse_rotation(atoi(content));
-	} else if (!strcasecmp(nodename, "left.area.tablet")) {
+	} else if (!strcasecmp(name, "left.area.tablet")) {
 		rc.tablet.box.x = tablet_get_dbl_if_positive(content, "left");
-	} else if (!strcasecmp(nodename, "top.area.tablet")) {
+	} else if (!strcasecmp(name, "top.area.tablet")) {
 		rc.tablet.box.y = tablet_get_dbl_if_positive(content, "top");
-	} else if (!strcasecmp(nodename, "width.area.tablet")) {
+	} else if (!strcasecmp(name, "width.area.tablet")) {
 		rc.tablet.box.width = tablet_get_dbl_if_positive(content, "width");
-	} else if (!strcasecmp(nodename, "height.area.tablet")) {
+	} else if (!strcasecmp(name, "height.area.tablet")) {
 		rc.tablet.box.height = tablet_get_dbl_if_positive(content, "height");
-	} else if (!strcasecmp(nodename, "button.map.tablet")) {
+	} else if (!strcasecmp(name, "button.map.tablet")) {
 		button_map_from = tablet_button_from_str(content);
-	} else if (!strcasecmp(nodename, "to.map.tablet")) {
+	} else if (!strcasecmp(name, "to.map.tablet")) {
 		if (button_map_from != UINT32_MAX) {
 			uint32_t button_map_to = mousebind_button_from_str(content, NULL);
 			if (button_map_to != UINT32_MAX) {
@@ -1256,135 +1227,137 @@ entry(xmlNode *node, char *nodename, char *content)
 		} else {
 			wlr_log(WLR_ERROR, "Missing 'button' argument for tablet button mapping");
 		}
-	} else if (!strcasecmp(nodename, "motion.tabletTool")) {
+	} else if (!strcasecmp(name, "motion.tabletTool")) {
 		rc.tablet_tool.motion = tablet_parse_motion(content);
-	} else if (!strcasecmp(nodename, "relativeMotionSensitivity.tabletTool")) {
+	} else if (!strcasecmp(name, "relativeMotionSensitivity.tabletTool")) {
 		rc.tablet_tool.relative_motion_sensitivity =
 			tablet_get_dbl_if_positive(content, "relativeMotionSensitivity");
-	} else if (!strcasecmp(nodename, "ignoreButtonReleasePeriod.menu")) {
+	} else if (!strcasecmp(name, "ignoreButtonReleasePeriod.menu")) {
 		rc.menu_ignore_button_release_period = atoi(content);
-	} else if (!strcasecmp(nodename, "width.magnifier")) {
+	} else if (!strcasecmp(name, "width.magnifier")) {
 		rc.mag_width = atoi(content);
-	} else if (!strcasecmp(nodename, "height.magnifier")) {
+	} else if (!strcasecmp(name, "height.magnifier")) {
 		rc.mag_height = atoi(content);
-	} else if (!strcasecmp(nodename, "initScale.magnifier")) {
+	} else if (!strcasecmp(name, "initScale.magnifier")) {
 		set_float(content, &rc.mag_scale);
-	} else if (!strcasecmp(nodename, "increment.magnifier")) {
+	} else if (!strcasecmp(name, "increment.magnifier")) {
 		set_float(content, &rc.mag_increment);
-	} else if (!strcasecmp(nodename, "useFilter.magnifier")) {
+	} else if (!strcasecmp(name, "useFilter.magnifier")) {
 		set_bool(content, &rc.mag_filter);
 	}
 }
 
-static void
-process_node(xmlNode *node)
-{
-	char *content;
-	static char buffer[256];
-	char *name;
+static void xml_tree_walk(xmlNode *node, struct parser_state *state);
 
-	content = (char *)node->content;
+static void
+traverse(xmlNode *node, struct parser_state *state)
+{
 	if (xmlIsBlankNode(node)) {
 		return;
 	}
-	name = nodename(node, buffer, sizeof(buffer));
-	entry(node, name, content);
-}
+	entry(node, state);
 
-static void xml_tree_walk(xmlNode *node);
-
-static void
-traverse(xmlNode *n)
-{
-	xmlAttr *attr;
-
-	process_node(n);
-	for (attr = n->properties; attr; attr = attr->next) {
-		xml_tree_walk(attr->children);
+	for (xmlAttr *attr = node->properties; attr; attr = attr->next) {
+		xml_tree_walk(attr->children, state);
 	}
-	xml_tree_walk(n->children);
+	xml_tree_walk(node->children, state);
 }
 
 static void
-xml_tree_walk(xmlNode *node)
+xml_tree_walk(xmlNode *node, struct parser_state *state)
 {
 	for (xmlNode *n = node; n && n->name; n = n->next) {
+		wlr_log(WLR_INFO, "%s", (char*)n->name);
 		if (!strcasecmp((char *)n->name, "comment")) {
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "margin")) {
 			in_usable_area_override = true;
-			traverse(n);
+			traverse(n, state);
 			in_usable_area_override = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "keybind")) {
 			in_keybind = true;
-			traverse(n);
+			traverse(n, state);
 			in_keybind = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "mousebind")) {
 			in_mousebind = true;
-			traverse(n);
+			traverse(n, state);
 			in_mousebind = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "touch")) {
 			in_touch = true;
-			traverse(n);
+			traverse(n, state);
 			in_touch = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "device")) {
 			in_libinput_category = true;
-			traverse(n);
+			traverse(n, state);
 			in_libinput_category = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "regions")) {
 			in_regions = true;
-			traverse(n);
+			traverse(n, state);
 			in_regions = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "fields")) {
 			in_window_switcher_field = true;
-			traverse(n);
+			traverse(n, state);
 			in_window_switcher_field = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "windowRules")) {
 			in_window_rules = true;
-			traverse(n);
+			traverse(n, state);
 			in_window_rules = false;
 			continue;
 		}
+		if (!strcasecmp((char *)n->name, "action")) {
+			/* Actions can be nested so we must save the current state when
+			descending */
+			struct parser_state new_state = *state;
+			new_state.current_action = NULL;
+			new_state.current_view_query = NULL;
+			new_state.in_action = true;
+			new_state.in_action_query = false;
+			new_state.in_action_then_branch = false;
+			new_state.in_action_else_branch = false;
+			new_state.in_action_none_branch = false;
+			traverse(n, &new_state);
+			continue;
+		}
 		if (!strcasecmp((char *)n->name, "query")) {
-			in_action_query = true;
-			traverse(n);
-			in_action_query = false;
+			state->in_action_query = true;
+			traverse(n, state);
+			state->in_action_query = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "then")) {
-			in_action_then_branch = true;
-			traverse(n);
-			in_action_then_branch = false;
+			state->in_action_then_branch = true;
+			traverse(n, state);
+			state->in_action_then_branch = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "else")) {
-			in_action_else_branch = true;
-			traverse(n);
-			in_action_else_branch = false;
+			state->in_action_else_branch = true;
+			traverse(n, state);
+			state->in_action_else_branch = false;
 			continue;
 		}
 		if (!strcasecmp((char *)n->name, "none")) {
-			in_action_none_branch = true;
-			traverse(n);
-			in_action_none_branch = false;
+			state->in_action_none_branch = true;
+			traverse(n, state);
+			state->in_action_none_branch = false;
 			continue;
 		}
-		traverse(n);
+		traverse(n, state);
 	}
 }
 
@@ -1397,7 +1370,7 @@ rcxml_parse_xml(struct buf *b)
 		wlr_log(WLR_ERROR, "error parsing config file");
 		return;
 	}
-	xml_tree_walk(xmlDocGetRootElement(d));
+	xml_tree_walk(xmlDocGetRootElement(d), &(struct parser_state) {});
 	xmlFreeDoc(d);
 	xmlCleanupParser();
 }
@@ -1999,8 +1972,6 @@ rcxml_finish(void)
 	current_mouse_context = NULL;
 	current_keybind_action = NULL;
 	current_mousebind_action = NULL;
-	current_child_action = NULL;
-	current_view_query = NULL;
 	current_region = NULL;
 	current_field = NULL;
 	current_window_rule = NULL;
